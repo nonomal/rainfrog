@@ -4,9 +4,11 @@ use color_eyre::eyre::{self, Result};
 use crossterm::event::{KeyEvent, MouseEventKind};
 use csv::Writer;
 use ratatui::{prelude::*, symbols::scrollbar, widgets::*};
+use ratatui_textarea::{Input, Key};
 use sqlparser::ast::Statement;
 use tokio::sync::mpsc::UnboundedSender;
-use tui_textarea::{Input, Key};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 use super::{
   Frame,
@@ -66,6 +68,10 @@ pub struct Data<'a> {
   explain_height: u16,
   explain_max_x_offset: u16,
   explain_max_y_offset: u16,
+}
+
+fn error_text(error: &eyre::Report) -> String {
+  format!("{error:#}")
 }
 
 impl Data<'_> {
@@ -216,19 +222,32 @@ impl Data<'_> {
   }
 
   fn cell_display_width(value: &str) -> usize {
-    value.chars().take(MAX_COLUMN_WIDTH as usize).count()
+    // stop once the cap is reached: a TEXT or JSON cell can be far longer than
+    // any column we will ever draw, and only the capped value is used
+    let mut width = 0_usize;
+    for grapheme in value.graphemes(true) {
+      width = width.saturating_add(grapheme.width());
+      if width >= MAX_COLUMN_WIDTH as usize {
+        return MAX_COLUMN_WIDTH as usize;
+      }
+    }
+    width
   }
 
-  fn clamp_render_text(value: &str, max_chars: usize) -> String {
-    if max_chars == 0 || value.is_empty() {
+  fn clamp_render_text(value: &str, max_width: usize) -> String {
+    if max_width == 0 || value.is_empty() {
       return String::new();
     }
-    let mut chars_seen = 0_usize;
-    for (idx, _) in value.char_indices() {
-      if chars_seen == max_chars {
+    let mut width_seen = 0_usize;
+    // measure per grapheme, not per char: a ZWJ sequence such as a family emoji
+    // is one glyph whose width is less than the sum of its parts, and splitting
+    // it would drop the rest of the value
+    for (idx, grapheme) in value.grapheme_indices(true) {
+      let grapheme_width = grapheme.width();
+      if width_seen.saturating_add(grapheme_width) > max_width {
         return value[..idx].to_owned();
       }
-      chars_seen = chars_seen.saturating_add(1);
+      width_seen = width_seen.saturating_add(grapheme_width);
     }
     value.to_owned()
   }
@@ -488,7 +507,7 @@ impl Component for Data<'_> {
           self.command_tx.clone().unwrap().send(Action::CopyData(text.to_string()))?;
           self.scrollable.transition_selection_mode(Some(SelectionMode::Copied));
         } else if let DataState::Error(err) = &self.data_state {
-          self.command_tx.clone().unwrap().send(Action::CopyData(err.to_string()))?;
+          self.command_tx.clone().unwrap().send(Action::CopyData(error_text(err)))?;
           self.scrollable.transition_selection_mode(Some(SelectionMode::Copied));
         }
       },
@@ -535,6 +554,11 @@ impl Component for Data<'_> {
 
   fn draw(&mut self, f: &mut Frame<'_>, area: Rect, app_state: &AppState) -> Result<()> {
     let focused = app_state.focus == Focus::Data;
+    let focus_hint = self
+      .config
+      .keybindings
+      .hint_for_action(app_state.focus, &Action::FocusData, "<alt+3>")
+      .map_or_else(String::new, |hint| format!(" {hint}"));
 
     let mut block = Block::default().borders(Borders::ALL).border_style(if focused {
       Style::new().green()
@@ -558,25 +582,30 @@ impl Component for Data<'_> {
       let row = &rows[y];
       let title_string = match self.scrollable.get_selection_mode() {
         Some(SelectionMode::Row) => {
-          format!(" 󰆼 results <alt+3> (row {} of {})", y.saturating_add(1), rows.len())
+          format!(" 󰆼 results{focus_hint} (row {} of {})", y.saturating_add(1), rows.len())
         },
         Some(SelectionMode::Cell) => {
           let cell = row
             .get(x)
             .map(|c| Self::preview_text(c, TITLE_CELL_PREVIEW_MAX_CHARS))
             .unwrap_or_default();
-          format!(" 󰆼 results <alt+3> (row {} of {}) - {} ", y.saturating_add(1), rows.len(), cell)
+          format!(
+            " 󰆼 results{focus_hint} (row {} of {}) - {} ",
+            y.saturating_add(1),
+            rows.len(),
+            cell
+          )
         },
         Some(SelectionMode::Copied) => {
-          format!(" 󰆼 results <alt+3> ({} rows) - copied! ", rows.len())
+          format!(" 󰆼 results{focus_hint} ({} rows) - copied! ", rows.len())
         },
-        _ => format!(" 󰆼 results <alt+3> ({} rows)", rows.len()),
+        _ => format!(" 󰆼 results{focus_hint} ({} rows)", rows.len()),
       };
       block = block.title(title_string);
     } else {
       let title_string = match self.scrollable.get_selection_mode() {
-        Some(SelectionMode::Copied) => " 󰆼 results <alt+3> - copied! ",
-        _ => " 󰆼 results <alt+3>",
+        Some(SelectionMode::Copied) => format!(" 󰆼 results{focus_hint} - copied! "),
+        _ => format!(" 󰆼 results{focus_hint}"),
       };
       block = block.title(title_string);
     }
@@ -676,7 +705,7 @@ impl Component for Data<'_> {
       },
       DataState::Error(e) => {
         f.render_widget(
-          Paragraph::new(e.to_string())
+          Paragraph::new(error_text(e))
             .style(Style::default().fg(Color::Red))
             .wrap(Wrap { trim: true })
             .block(block),
@@ -712,12 +741,9 @@ struct TableForYank {
 
 impl TableForYank {
   fn new(rows: &Rows, app_state: &AppState) -> Self {
-    let sql = app_state
-      .history
-      .first()
-      .expect("expected the last SQL query in history")
-      .query_lines
-      .clone();
+    // history can be empty here: it is cleared with [D] in the history pane
+    // while the results of the last query are still on screen
+    let sql = app_state.history.first().map(|entry| entry.query_lines.clone()).unwrap_or_default();
 
     let headers: &Vec<String> = &rows.headers.iter().map(|h| h.name.clone()).collect();
     let rows = &rows.rows;
@@ -742,7 +768,9 @@ impl TableForYank {
       buff.push('\n');
     }
 
-    buff.push('\n');
+    if !self.sql.is_empty() {
+      buff.push('\n');
+    }
 
     while let Some(col) = self.table.first() {
       if col.is_empty() {
@@ -761,20 +789,26 @@ impl TableForYank {
   }
 
   fn format_column(col: &mut VecDeque<String>, index: usize, last_index: usize) {
-    let width = col.iter().map(|s| s.len()).max().unwrap_or(1) + 1;
+    let width = col.iter().map(|s| s.width()).max().unwrap_or(1) + 1;
 
     let format_cell = |s: &str| {
-      let prefix = if index == 0 { " " } else { "| " };
-      let padding =
-        if index == last_index { " ".repeat(0) } else { " ".repeat(width.saturating_sub(s.len())) };
+      let prefix = if index == 0 { "" } else { "| " };
+      let padding = if index == last_index {
+        " ".repeat(0)
+      } else {
+        " ".repeat(width.saturating_sub(s.width()))
+      };
       format!("{prefix}{s}{padding}")
     };
 
     col.iter_mut().for_each(|s| *s = format_cell(s));
 
     if let Some(header) = col.pop_front() {
-      let div =
-        if index == 0 { "-".repeat(width + 1) } else { format!("+{}", "-".repeat(width + 1)) };
+      let div = if index == 0 {
+        "-".repeat(width + if index == 0 { 0 } else { 1 })
+      } else {
+        format!("+{}", "-".repeat(width + 1))
+      };
       col.push_front(div);
       col.push_front(header);
     }
@@ -790,6 +824,92 @@ impl TableForYank {
         col
       })
       .collect()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::database::Header;
+
+  #[test]
+  fn error_text_includes_os_error() {
+    let os_error = std::io::Error::from_raw_os_error(2);
+    let os_message = os_error.to_string();
+    let error = eyre::Report::new(os_error).wrap_err("Failed to launch external editor 'vi'");
+
+    assert_eq!(error_text(&error), format!("Failed to launch external editor 'vi': {os_message}"));
+  }
+
+  #[test]
+  fn compact_column_widths_use_display_width() {
+    let rows = Rows {
+      headers: vec![
+        Header { name: "id".to_owned(), type_name: "int4".to_owned() },
+        Header { name: "name".to_owned(), type_name: "text".to_owned() },
+      ],
+      rows: vec![vec!["1".to_owned(), "日本語".to_owned()], vec!["2".to_owned(), "ab".to_owned()]],
+      rows_affected: None,
+    };
+
+    // "日本語" is 3 chars but occupies 6 terminal cells, plus 1 cell of padding.
+    assert_eq!(Data::compact_column_widths(&rows), vec![5, 7]);
+  }
+
+  #[test]
+  fn clamp_render_text_never_exceeds_the_column_width() {
+    // 4 wide chars occupy 8 cells, so only 3 of them fit in a 7 cell column.
+    assert_eq!(Data::clamp_render_text("日本語テ", 7), "日本語");
+    assert_eq!(Data::clamp_render_text("日本語テ", 8), "日本語テ");
+    assert_eq!(Data::clamp_render_text("abcd", 3), "abc");
+  }
+
+  #[test]
+  fn clamp_render_text_keeps_zwj_sequences_whole() {
+    // a family emoji is one glyph of 2 cells, but 7 chars whose widths sum to 8,
+    // so measuring per char would keep only the first man and drop the rest
+    let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}";
+    assert_eq!(Data::cell_display_width(family), 2);
+    assert_eq!(Data::clamp_render_text(family, 2), family);
+    assert_eq!(Data::clamp_render_text(family, 1), "");
+    // a value fitting its own measured width must survive clamping intact
+    let value = format!("{family}ab");
+    assert_eq!(Data::clamp_render_text(&value, Data::cell_display_width(&value)), value);
+  }
+
+  #[test]
+  fn yank_all_after_the_history_is_cleared_does_not_panic() {
+    // [D] in the history pane clears the history while the results of the last
+    // query are still displayed, so [Y] must not assume history is non-empty
+    let app_state = crate::components::app_state_with_focus(Focus::Data);
+    assert!(app_state.history.is_empty());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut data = Data::new();
+    data.register_action_handler(tx).unwrap();
+    data.set_data_state(
+      Some(Ok(Rows {
+        headers: vec![Header { name: "id".to_owned(), type_name: "int4".to_owned() }],
+        rows: vec![vec!["1".to_owned()], vec!["2".to_owned()]],
+        rows_affected: None,
+      })),
+      None,
+    );
+
+    data.update(Action::YankAll, &app_state).unwrap();
+
+    let Some(Action::CopyData(yanked)) = rx.try_recv().ok() else {
+      panic!("expected the yanked table to be copied");
+    };
+    assert_eq!(yanked, "id\n---\n1\n2\n");
+  }
+
+  #[test]
+  fn cell_display_width_stops_at_the_maximum() {
+    let long = "x".repeat(100_000);
+    assert_eq!(Data::cell_display_width(&long), MAX_COLUMN_WIDTH as usize);
+    // a value shorter than the cap is still measured exactly
+    assert_eq!(Data::cell_display_width("abc"), 3);
   }
 }
 
@@ -828,6 +948,35 @@ mod yank {
     ];
 
     assert_eq!(expected, result)
+  }
+
+  #[test]
+  fn yank_aligns_columns_by_display_width() {
+    let headers = vec!["id".to_string(), "name".to_string(), "age".to_string()];
+    let rows = vec![
+      vec!["1".to_string(), "café".to_string(), "30".to_string()],
+      vec!["2".to_string(), "abcd".to_string(), "40".to_string()],
+      vec!["3".to_string(), "日本語".to_string(), "50".to_string()],
+    ];
+
+    let mut data_to_yank = TableForYank {
+      sql: vec!["select * from t".to_string()],
+      table: TableForYank::to_columns(&headers, &rows),
+    };
+
+    let result = data_to_yank.yank();
+
+    let expected = "\
+select * from t
+
+id | name   | age
+---+--------+-----
+1  | café   | 30
+2  | abcd   | 40
+3  | 日本語 | 50
+";
+
+    assert_eq!(expected, result);
   }
 
   #[test]

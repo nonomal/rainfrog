@@ -9,36 +9,48 @@ use std::{
 use async_trait::async_trait;
 use color_eyre::eyre::{self, Result};
 use futures::stream::StreamExt;
+use sqlparser::ast::Statement;
 use sqlx::{
   Column, Either, Row, ValueRef,
   sqlite::{Sqlite, SqliteConnectOptions, SqlitePoolOptions},
-  types::uuid,
 };
 use tracing::Instrument;
 
 use super::{
-  Database, DbTaskResult, Driver, Header, Headers, QueryResultsWithMetadata, QueryTask, Rows, Value,
+  Database, DbTaskResult, Driver, Header, Headers, QueryResultsWithMetadata, QueryTask, Rows,
+  Value, builtin_functions,
 };
+use crate::completion::{TableColumns, TableRef, table_columns_from_rows};
 
-type SqliteTransaction<'a> = sqlx::Transaction<'a, Sqlite>;
-type TransactionTask<'a> =
-  tokio::task::JoinHandle<(QueryResultsWithMetadata, SqliteTransaction<'a>)>;
-enum SqliteTask<'a> {
+type SqliteTransaction = sqlx::Transaction<'static, Sqlite>;
+type TransactionAcquireTask = tokio::task::JoinHandle<Result<SqliteTransaction>>;
+type TransactionTask = tokio::task::JoinHandle<(QueryResultsWithMetadata, SqliteTransaction)>;
+enum SqliteTask {
   Query(QueryTask),
-  TxStart(TransactionTask<'a>),
-  TxPending(Box<(SqliteTransaction<'a>, QueryResultsWithMetadata)>),
+  TxConnect {
+    handle: TransactionAcquireTask,
+    first_query: String,
+    statement_type: Box<Statement>,
+    display_statement_type: Box<Statement>,
+  },
+  TxStart(TransactionTask),
+  TxPending(Box<(SqliteTransaction, QueryResultsWithMetadata)>),
 }
 
 #[derive(Default)]
-pub struct SqliteDriver<'a> {
+pub struct SqliteDriver {
   pool: Option<Arc<sqlx::Pool<Sqlite>>>,
-  task: Option<SqliteTask<'a>>,
+  task: Option<SqliteTask>,
 }
 
 #[async_trait(?Send)]
-impl Database for SqliteDriver<'_> {
+impl Database for SqliteDriver {
+  fn builtin_functions(&self) -> &'static [&'static str] {
+    builtin_functions::SQLITE
+  }
+
   async fn init(&mut self, args: crate::cli::Cli) -> Result<String> {
-    let opts = super::sqlite::SqliteDriver::<'_>::build_connection_opts(args)?;
+    let opts = super::sqlite::SqliteDriver::build_connection_opts(args)?;
     let pool =
       Arc::new(SqlitePoolOptions::new().max_connections(3).connect_with(opts.clone()).await?);
     self.pool = Some(pool);
@@ -79,6 +91,7 @@ impl Database for SqliteDriver<'_> {
       Some(task) => {
         match task {
           SqliteTask::Query(handle) => handle.abort(),
+          SqliteTask::TxConnect { handle, .. } => handle.abort(),
           SqliteTask::TxStart(handle) => handle.abort(),
           _ => {},
         };
@@ -97,6 +110,47 @@ impl Database for SqliteDriver<'_> {
         } else {
           let result = handle.await?;
           (DbTaskResult::Finished(result), None)
+        }
+      },
+      Some(SqliteTask::TxConnect {
+        handle,
+        first_query,
+        statement_type,
+        display_statement_type,
+      }) => {
+        if !handle.is_finished() {
+          (
+            DbTaskResult::Pending,
+            Some(SqliteTask::TxConnect {
+              handle,
+              first_query,
+              statement_type,
+              display_statement_type,
+            }),
+          )
+        } else {
+          match handle.await? {
+            Ok(tx) => (
+              DbTaskResult::Pending,
+              Some(SqliteTask::TxStart(spawn_tx_task(
+                tx,
+                first_query,
+                *statement_type,
+                *display_statement_type,
+              ))),
+            ),
+            Err(e) => {
+              log::error!("Transaction didn't start: {e:?}");
+              (
+                DbTaskResult::Finished(QueryResultsWithMetadata::with_display_statement_type(
+                  Err(e),
+                  Some(*statement_type),
+                  Some(*display_statement_type),
+                )),
+                None,
+              )
+            },
+          }
         }
       },
       Some(SqliteTask::TxStart(handle)) => {
@@ -146,52 +200,13 @@ impl Database for SqliteDriver<'_> {
     let (first_query, statement_type) = super::get_first_query(query, Driver::Sqlite)?;
     let display_statement_type = super::get_display_statement_for_execution_type(&statement_type);
     let statement_type = super::get_statement_for_execution_type(&statement_type);
-    let tx = self.pool.as_mut().unwrap().begin().await?;
-    self.task = Some(SqliteTask::TxStart(tokio::spawn(
-      async move {
-        let (results, tx) = query_with_tx(tx, &first_query).await;
-        match results {
-          Ok(Either::Left(rows_affected)) => {
-            log::info!("{rows_affected:?} rows affected");
-            (
-              QueryResultsWithMetadata {
-                results: Ok(Rows {
-                  headers: vec![],
-                  rows: vec![],
-                  rows_affected: Some(rows_affected),
-                }),
-                statement_type: Some(statement_type),
-                display_statement_type: Some(display_statement_type),
-              },
-              tx,
-            )
-          },
-          Ok(Either::Right(rows)) => {
-            log::info!("{:?} rows affected", rows.rows_affected);
-            (
-              QueryResultsWithMetadata::with_display_statement_type(
-                Ok(rows),
-                Some(statement_type),
-                Some(display_statement_type),
-              ),
-              tx,
-            )
-          },
-          Err(e) => {
-            log::error!("{e:?}");
-            (
-              QueryResultsWithMetadata::with_display_statement_type(
-                Err(e),
-                Some(statement_type),
-                Some(display_statement_type),
-              ),
-              tx,
-            )
-          },
-        }
-      }
-      .in_current_span(),
-    )));
+    let pool = self.pool.clone().unwrap();
+    self.task = Some(SqliteTask::TxConnect {
+      handle: tokio::spawn(async move { Ok(pool.begin().await?) }.in_current_span()),
+      first_query,
+      statement_type: Box::new(statement_type),
+      display_statement_type: Box::new(display_statement_type),
+    });
     Ok(())
   }
 
@@ -216,10 +231,12 @@ impl Database for SqliteDriver<'_> {
     Ok(())
   }
 
-  async fn load_menu(&self) -> Result<Rows> {
-    query_with_pool(
-      self.pool.clone().unwrap(),
-      "select '' as table_schema,
+  fn start_load_menu(&self) -> Result<tokio::task::JoinHandle<Result<Rows>>> {
+    let pool = self.pool.clone().unwrap();
+    Ok(tokio::spawn(async move {
+      query_with_pool(
+        pool,
+        "select '' as table_schema,
         name as table_name,
         case
           when type = 'table' then 'table'
@@ -230,9 +247,26 @@ impl Database for SqliteDriver<'_> {
       where type in ('table', 'view')
       and name not like 'sqlite_%'
       order by object_kind, name asc"
-        .to_owned(),
-    )
-    .await
+          .to_owned(),
+      )
+      .await
+    }))
+  }
+
+  fn start_load_columns(
+    &self,
+    tables: Vec<TableRef>,
+  ) -> Result<tokio::task::JoinHandle<Result<Vec<TableColumns>>>> {
+    let pool = self.pool.clone().unwrap();
+    Ok(tokio::spawn(async move {
+      let mut output = Vec::with_capacity(tables.len());
+      for table in tables {
+        let name = table.table.replace('\'', "''");
+        let query = format!("select name, type from pragma_table_info('{name}') order by cid");
+        output.push(table_columns_from_rows(table, query_with_pool(pool.clone(), query).await?));
+      }
+      Ok(output)
+    }))
   }
 
   fn preview_rows_query(&self, schema: &str, table: &str) -> String {
@@ -263,7 +297,7 @@ impl Database for SqliteDriver<'_> {
   }
 }
 
-impl SqliteDriver<'_> {
+impl SqliteDriver {
   pub fn new() -> Self {
     Self { pool: None, task: None }
   }
@@ -299,6 +333,52 @@ async fn query_with_pool(pool: Arc<sqlx::Pool<Sqlite>>, query: String) -> Result
   query_with_stream(&*pool.clone(), &query).await
 }
 
+fn spawn_tx_task(
+  tx: SqliteTransaction,
+  first_query: String,
+  statement_type: Statement,
+  display_statement_type: Statement,
+) -> TransactionTask {
+  tokio::spawn(async move {
+    let (results, tx) = query_with_tx(tx, &first_query).await;
+    match results {
+      Ok(Either::Left(rows_affected)) => {
+        log::info!("{rows_affected:?} rows affected");
+        (
+          QueryResultsWithMetadata {
+            results: Ok(Rows { headers: vec![], rows: vec![], rows_affected: Some(rows_affected) }),
+            statement_type: Some(statement_type),
+            display_statement_type: Some(display_statement_type),
+          },
+          tx,
+        )
+      },
+      Ok(Either::Right(rows)) => {
+        log::info!("{:?} rows affected", rows.rows_affected);
+        (
+          QueryResultsWithMetadata::with_display_statement_type(
+            Ok(rows),
+            Some(statement_type),
+            Some(display_statement_type),
+          ),
+          tx,
+        )
+      },
+      Err(e) => {
+        log::error!("{e:?}");
+        (
+          QueryResultsWithMetadata::with_display_statement_type(
+            Err(e),
+            Some(statement_type),
+            Some(display_statement_type),
+          ),
+          tx,
+        )
+      },
+    }
+  })
+}
+
 async fn query_with_stream<'a, E>(e: E, query: &'a str) -> Result<Rows>
 where
   E: sqlx::Executor<'a, Database = sqlx::Sqlite>,
@@ -326,10 +406,10 @@ where
   Ok(Rows { rows_affected: query_rows_affected, headers, rows: query_rows })
 }
 
-async fn query_with_tx<'a>(
-  mut tx: SqliteTransaction<'static>,
+async fn query_with_tx(
+  mut tx: SqliteTransaction,
   query: &str,
-) -> (Result<Either<u64, Rows>>, SqliteTransaction<'static>)
+) -> (Result<Either<u64, Rows>>, SqliteTransaction)
 where
   for<'c> <sqlx::Sqlite as sqlx::Database>::Arguments<'c>: sqlx::IntoArguments<'c, sqlx::Sqlite>,
   for<'c> &'c mut <sqlx::Sqlite as sqlx::Database>::Connection:
@@ -393,43 +473,10 @@ fn parse_value(
       Value { parse_error: true, string: "_ERROR_".to_string(), is_null: false },
       |received| Value { parse_error: false, string: received.to_string(), is_null: false },
     )),
-    "TEXT" => {
-      // Try parsing as different types that might be stored as TEXT
-      match row.try_get::<chrono::NaiveDateTime, _>(col.ordinal()) {
-        Ok(dt) => Some(Value { parse_error: false, string: dt.to_string(), is_null: false }),
-        _ => match row.try_get::<chrono::DateTime<chrono::Utc>, _>(col.ordinal()) {
-          Ok(dt) => Some(Value { parse_error: false, string: dt.to_string(), is_null: false }),
-          _ => match row.try_get::<chrono::NaiveDate, _>(col.ordinal()) {
-            Ok(date) => {
-              Some(Value { parse_error: false, string: date.to_string(), is_null: false })
-            },
-            _ => match row.try_get::<chrono::NaiveTime, _>(col.ordinal()) {
-              Ok(time) => {
-                Some(Value { parse_error: false, string: time.to_string(), is_null: false })
-              },
-              _ => match row.try_get::<uuid::Uuid, _>(col.ordinal()) {
-                Ok(uuid) => {
-                  Some(Value { parse_error: false, string: uuid.to_string(), is_null: false })
-                },
-                _ => match row.try_get::<serde_json::Value, _>(col.ordinal()) {
-                  Ok(json) => {
-                    Some(Value { parse_error: false, string: json.to_string(), is_null: false })
-                  },
-                  _ => match row.try_get::<String, _>(col.ordinal()) {
-                    Ok(string) => Some(Value { parse_error: false, string, is_null: false }),
-                    _ => Some(Value {
-                      parse_error: true,
-                      string: "_ERROR_".to_string(),
-                      is_null: false,
-                    }),
-                  },
-                },
-              },
-            },
-          },
-        },
-      }
-    },
+    "TEXT" => Some(row.try_get::<String, usize>(col.ordinal()).map_or(
+      Value { parse_error: true, string: "_ERROR_".to_string(), is_null: false },
+      |received| Value { parse_error: false, string: received, is_null: false },
+    )),
     "BLOB" => Some(row.try_get::<Vec<u8>, usize>(col.ordinal()).map_or(
       Value { parse_error: true, string: "_ERROR_".to_string(), is_null: false },
       |received| {
@@ -496,6 +543,52 @@ mod tests {
 
   use super::*;
   use crate::database::{ExecutionType, ParseError, get_execution_type, get_first_query};
+
+  #[tokio::test]
+  async fn completion_catalog_loads_from_memory_database() {
+    let pool = Arc::new(
+      SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap(),
+    );
+    sqlx::query("create table users(id integer, name text)").execute(pool.as_ref()).await.unwrap();
+    let driver = SqliteDriver { pool: Some(pool), task: None };
+
+    let menu = driver.start_load_menu().unwrap().await.unwrap().unwrap();
+    assert!(menu.rows.iter().any(|row| row.get(1).is_some_and(|name| name == "users")));
+
+    let table = TableRef { schema: String::new(), table: "users".into() };
+    let columns = driver.start_load_columns(vec![table]).unwrap().await.unwrap().unwrap();
+    assert_eq!(
+      columns[0].columns.iter().map(|column| column.name.as_str()).collect::<Vec<_>>(),
+      vec!["id", "name"]
+    );
+  }
+
+  #[tokio::test]
+  async fn declared_text_values_are_preserved() {
+    let pool = Arc::new(
+      SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap(),
+    );
+    sqlx::query("create table repro(value text)").execute(pool.as_ref()).await.unwrap();
+    sqlx::query("insert into repro values (?), (?), (?)")
+      .bind("abcdefghijklmnop")
+      .bind("abcdefghijklmnopq")
+      .bind(r#"{"key": "value"}"#)
+      .execute(pool.as_ref())
+      .await
+      .unwrap();
+
+    let rows =
+      query_with_pool(pool, "select value from repro order by rowid".into()).await.unwrap();
+
+    assert_eq!(
+      rows.rows,
+      vec![
+        vec!["abcdefghijklmnop".to_owned()],
+        vec!["abcdefghijklmnopq".to_owned()],
+        vec![r#"{"key": "value"}"#.to_owned()],
+      ]
+    );
+  }
 
   #[test]
   fn test_get_first_query() {

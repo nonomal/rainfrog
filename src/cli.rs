@@ -40,6 +40,14 @@ pub struct Cli {
   #[arg(long = "password", value_name = "PASSWORD", help = "Password for database connection")]
   pub password: Option<String>,
 
+  #[arg(
+    short = 'R',
+    long = "reenter-password",
+    action = clap::ArgAction::SetTrue,
+    help = "Reenter the password for a saved database connection"
+  )]
+  pub reenter_password: bool,
+
   #[arg(long = "host", value_name = "HOST", help = "Host for database connection (ex. localhost)")]
   pub host: Option<String>,
 
@@ -67,6 +75,13 @@ pub struct Cli {
   )]
   pub enable_cleartext_plugin: bool,
 
+  #[arg(
+    long = "ssl-required",
+    action = clap::ArgAction::SetTrue,
+    help = "Require an SSL/TLS connection (supported by PostgreSQL, MySQL, and Oracle)"
+  )]
+  pub ssl_required: bool,
+
   #[arg(skip)]
   pub connection_name: Option<String>,
 }
@@ -85,6 +100,7 @@ pub enum Driver {
   MySql,
   #[serde(alias = "sqlite", alias = "SQLITE")]
   Sqlite,
+  #[cfg(feature = "oracle")]
   #[serde(alias = "oracle", alias = "ORACLE")]
   Oracle,
   #[cfg(feature = "duckdb")]
@@ -100,6 +116,7 @@ impl FromStr for Driver {
       "postgres" | "postgresql" => Ok(Driver::Postgres),
       "mysql" => Ok(Driver::MySql),
       "sqlite" => Ok(Driver::Sqlite),
+      #[cfg(feature = "oracle")]
       "oracle" => Ok(Driver::Oracle),
       #[cfg(feature = "duckdb")]
       "duckdb" => Ok(Driver::DuckDb),
@@ -190,7 +207,9 @@ mod tests {
       ("sqlite:///tmp/data.sqlite", Driver::Sqlite),
       ("sqlite:///var/lib/sqlite/app.sqlite3", Driver::Sqlite),
       ("sqlite://localhost/var/data.sqlite?mode=ro", Driver::Sqlite),
+      #[cfg(feature = "oracle")]
       ("oracle://scott:tiger@//prod-db.example.com:1521/ORCLPDB1", Driver::Oracle),
+      #[cfg(feature = "oracle")]
       ("oracle://user:pass@db-host/service_name", Driver::Oracle),
       #[cfg(feature = "duckdb")]
       ("duckdb:///var/tmp/cache.duckdb", Driver::DuckDb),
@@ -215,7 +234,9 @@ mod tests {
       ("jdbc:mysql:loadbalance://db1.example.com:3306,db2.example.com:3306/app", Driver::MySql),
       ("jdbc:sqlite://localhost/path", Driver::Sqlite),
       ("jdbc:sqlite:/var/lib/sqlite/cache.sqlite3", Driver::Sqlite),
+      #[cfg(feature = "oracle")]
       ("jdbc:oracle:thin:@localhost:1521/dbname", Driver::Oracle),
+      #[cfg(feature = "oracle")]
       ("jdbc:oracle:oci:@//prod-host:1521/ORCLCDB.localdomain", Driver::Oracle),
       #[cfg(feature = "duckdb")]
       ("jdbc:duckdb:/var/lib/duckdb/cache.duckdb", Driver::DuckDb),
@@ -291,6 +312,13 @@ mod tests {
     }
   }
 
+  #[cfg(not(feature = "oracle"))]
+  #[test]
+  fn oracle_driver_is_unavailable_without_feature() {
+    assert!("oracle".parse::<Driver>().is_err());
+    assert!(extract_driver_from_url("oracle://localhost/database").is_err());
+  }
+
   #[test]
   fn parses_edit_subcommand() {
     let cli = Cli::parse_from(["rainfrog", "edit"]);
@@ -307,5 +335,35 @@ mod tests {
   fn enable_cleartext_plugin_flag_sets_true() {
     let cli = Cli::parse_from(["rainfrog", "--enable-cleartext-plugin"]);
     assert!(cli.enable_cleartext_plugin);
+  }
+
+  #[test]
+  fn reenter_password_defaults_to_false() {
+    let cli = Cli::parse_from(["rainfrog"]);
+    assert!(!cli.reenter_password);
+  }
+
+  #[test]
+  fn reenter_password_long_flag_sets_true() {
+    let cli = Cli::parse_from(["rainfrog", "--reenter-password"]);
+    assert!(cli.reenter_password);
+  }
+
+  #[test]
+  fn reenter_password_short_flag_sets_true() {
+    let cli = Cli::parse_from(["rainfrog", "-R"]);
+    assert!(cli.reenter_password);
+  }
+
+  #[test]
+  fn ssl_required_defaults_to_false() {
+    let cli = Cli::parse_from(["rainfrog"]);
+    assert!(!cli.ssl_required);
+  }
+
+  #[test]
+  fn ssl_required_flag_sets_true() {
+    let cli = Cli::parse_from(["rainfrog", "--ssl-required"]);
+    assert!(cli.ssl_required);
   }
 }

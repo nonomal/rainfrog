@@ -2,20 +2,25 @@ use async_trait::async_trait;
 use color_eyre::eyre::Result;
 #[cfg(feature = "duckdb")]
 use sqlparser::dialect::DuckDbDialect;
+#[cfg(feature = "oracle")]
+use sqlparser::dialect::GenericDialect;
 
 use sqlparser::{
   ast::{Query, SetExpr, Statement},
-  dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
+  dialect::{Dialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect},
   keywords,
   parser::{Parser, ParserError},
 };
 use tokio::task::JoinHandle;
 
 use crate::cli::{Cli, Driver};
+use crate::completion::{TableColumns, TableRef};
 
+mod builtin_functions;
 #[cfg(feature = "duckdb")]
 mod duckdb;
 mod mysql;
+#[cfg(feature = "oracle")]
 mod oracle;
 mod postgresql;
 mod sqlite;
@@ -23,6 +28,7 @@ mod sqlite;
 #[cfg(feature = "duckdb")]
 pub use duckdb::DuckDbDriver;
 pub use mysql::MySqlDriver;
+#[cfg(feature = "oracle")]
 pub use oracle::OracleDriver;
 pub use postgresql::PostgresDriver;
 pub use sqlite::SqliteDriver;
@@ -103,6 +109,9 @@ pub enum DbTaskResult {
 
 #[async_trait(?Send)]
 pub trait Database {
+  /// Returns the built-in functions available for completion for this driver.
+  fn builtin_functions(&self) -> &'static [&'static str];
+
   /// Initialize the database connection. Should handle create
   /// a pool or connection that's reused for other operations.
   /// Must be called to actually connect to the database (just
@@ -138,9 +147,14 @@ pub trait Database {
   /// if no transaction is pending.
   async fn rollback_tx(&mut self) -> Result<()>;
 
-  /// Returns rows representing the database menu. The menu component
-  /// expects each row to be combination of schema, object name, and kind.
-  async fn load_menu(&self) -> Result<Rows>;
+  /// Starts loading rows representing the database menu without blocking the UI loop.
+  fn start_load_menu(&self) -> Result<JoinHandle<Result<Rows>>>;
+
+  /// Starts loading normalized column metadata for the requested tables.
+  fn start_load_columns(
+    &self,
+    tables: Vec<TableRef>,
+  ) -> Result<JoinHandle<Result<Vec<TableColumns>>>>;
 
   /// Returns a query that can be used to preview the rows in a table.
   fn preview_rows_query(&self, schema: &str, table: &str) -> String;
@@ -388,6 +402,7 @@ pub fn get_dialect(driver: Driver) -> Box<dyn Dialect + Send + Sync> {
     Driver::Postgres => Box::new(PostgreSqlDialect {}),
     Driver::MySql => Box::new(MySqlDialect {}),
     Driver::Sqlite => Box::new(SQLiteDialect {}),
+    #[cfg(feature = "oracle")]
     Driver::Oracle => Box::new(GenericDialect {}),
     #[cfg(feature = "duckdb")]
     Driver::DuckDb => Box::new(DuckDbDialect {}),
@@ -401,6 +416,48 @@ pub trait HasRowsAffected {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn builtin_function_providers_expose_documented_functions() {
+    fn assert_sorted_and_unique(functions: &[&str]) {
+      assert!(!functions.is_empty());
+      assert!(
+        functions.windows(2).all(|pair| pair[0] < pair[1]),
+        "built-in function lists must be sorted and deduplicated"
+      );
+    }
+
+    let postgres = PostgresDriver::new().builtin_functions();
+    assert_sorted_and_unique(postgres);
+    assert!(postgres.contains(&"GENERATE_SERIES"));
+    assert!(postgres.contains(&"JSONB_BUILD_OBJECT"));
+
+    let mysql = MySqlDriver::new().builtin_functions();
+    assert_sorted_and_unique(mysql);
+    assert!(mysql.contains(&"DATE_FORMAT"));
+    assert!(mysql.contains(&"JSON_EXTRACT"));
+
+    let sqlite = SqliteDriver::new().builtin_functions();
+    assert_sorted_and_unique(sqlite);
+    assert!(sqlite.contains(&"JSON_EXTRACT"));
+    assert!(sqlite.contains(&"JULIANDAY"));
+
+    #[cfg(feature = "oracle")]
+    {
+      let oracle = OracleDriver::new().builtin_functions();
+      assert_sorted_and_unique(oracle);
+      assert!(oracle.contains(&"NVL"));
+      assert!(oracle.contains(&"TO_CHAR"));
+    }
+
+    #[cfg(feature = "duckdb")]
+    {
+      let duckdb = DuckDbDriver::new().builtin_functions();
+      assert_sorted_and_unique(duckdb);
+      assert!(duckdb.contains(&"LIST_TRANSFORM"));
+      assert!(duckdb.contains(&"READ_PARQUET"));
+    }
+  }
 
   #[test]
   fn cte_wrapped_writes_use_write_execution_type() {

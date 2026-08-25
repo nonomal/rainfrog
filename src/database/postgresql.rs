@@ -9,10 +9,11 @@ use std::{
 use async_trait::async_trait;
 use color_eyre::eyre::{self, Result};
 use futures::stream::StreamExt;
+use sqlparser::ast::Statement;
 use sqlx::{
   Column, Either, Row, ValueRef,
   pool::PoolConnection,
-  postgres::{PgConnectOptions, PgConnection, PgPoolOptions, Postgres},
+  postgres::{PgConnectOptions, PgConnection, PgPoolOptions, PgSslMode, Postgres},
   types::Uuid,
 };
 use tokio::sync::Mutex;
@@ -21,15 +22,29 @@ use tracing::Instrument;
 
 use super::{
   Database, DbTaskResult, Driver, Header, Headers, QueryResultsWithMetadata, QueryTask, Rows,
-  Value, vec_to_string,
+  Value, builtin_functions, vec_to_string,
 };
+use crate::completion::{TableColumns, TableRef, table_columns_from_rows};
 
-type PostgresTransaction<'a> = sqlx::Transaction<'a, Postgres>;
-type TransactionTask<'a> = JoinHandle<(QueryResultsWithMetadata, PostgresTransaction<'a>)>;
-enum PostgresTask<'a> {
+type PostgresTransaction = sqlx::Transaction<'static, Postgres>;
+type ConnectionTask = JoinHandle<Result<(Arc<Mutex<PoolConnection<Postgres>>>, i32)>>;
+type TransactionAcquireTask = JoinHandle<Result<(PostgresTransaction, i32)>>;
+type TransactionTask = JoinHandle<(QueryResultsWithMetadata, PostgresTransaction)>;
+enum PostgresTask {
+  QueryConnect {
+    handle: ConnectionTask,
+    first_query: String,
+    statement_type: Option<Statement>,
+  },
   Query(QueryTask),
-  TxStart(TransactionTask<'a>),
-  TxPending(Box<(PostgresTransaction<'a>, QueryResultsWithMetadata)>),
+  TxConnect {
+    handle: TransactionAcquireTask,
+    first_query: String,
+    statement_type: Statement,
+    display_statement_type: Box<Statement>,
+  },
+  TxStart(TransactionTask),
+  TxPending(Box<(PostgresTransaction, QueryResultsWithMetadata)>),
 }
 
 const MENU_QUERY: &str =
@@ -70,17 +85,21 @@ const SIMPLE_MENU_QUERY: &str = "select table_schema, table_name as object_name,
       order by table_schema, object_kind, object_name asc";
 
 #[derive(Default)]
-pub struct PostgresDriver<'a> {
+pub struct PostgresDriver {
   pool: Option<Arc<sqlx::Pool<Postgres>>>,
-  task: Option<PostgresTask<'a>>,
+  task: Option<PostgresTask>,
   querying_conn: Option<Arc<Mutex<PoolConnection<Postgres>>>>,
   querying_pid: Option<String>,
 }
 
 #[async_trait(?Send)]
-impl Database for PostgresDriver<'_> {
+impl Database for PostgresDriver {
+  fn builtin_functions(&self) -> &'static [&'static str] {
+    builtin_functions::POSTGRESQL
+  }
+
   async fn init(&mut self, args: crate::cli::Cli) -> Result<String> {
-    let opts = super::postgresql::PostgresDriver::<'_>::build_connection_opts(args)?;
+    let opts = super::postgresql::PostgresDriver::build_connection_opts(args)?;
     let pool = Arc::new(PgPoolOptions::new().max_connections(3).connect_with(opts.clone()).await?);
     self.pool = Some(pool);
     Ok(format!("{}/{}", opts.get_port(), opts.get_database().unwrap_or("postgres")))
@@ -97,31 +116,18 @@ impl Database for PostgresDriver<'_> {
       },
     };
     let pool = self.pool.clone().unwrap();
-    self.querying_conn = Some(Arc::new(Mutex::new(pool.acquire().await?)));
-    let conn = self.querying_conn.clone().unwrap();
-    let conn_for_task = conn.clone();
-    let pid = sqlx::raw_sql("SELECT pg_backend_pid()")
-      .fetch_one(conn.lock().await.as_mut())
-      .await?
-      .get::<i32, _>(0);
-    log::info!("Starting query with PID {}", pid.clone());
-    self.querying_pid = Some(pid.to_string().clone());
-    self.task = Some(PostgresTask::Query(tokio::spawn(
-      async move {
-        let results =
-          query_with_conn(conn_for_task.lock().await.as_mut(), first_query.clone()).await;
-        match results {
-          Ok(ref rows) => {
-            log::info!("{:?} rows, {:?} affected", rows.rows.len(), rows.rows_affected);
-          },
-          Err(ref e) => {
-            log::error!("{e:?}");
-          },
-        };
-        QueryResultsWithMetadata::new(results, statement_type.clone())
-      }
-      .in_current_span(),
-    )));
+    self.task = Some(PostgresTask::QueryConnect {
+      handle: tokio::spawn(
+        async move {
+          let conn = Arc::new(Mutex::new(pool.acquire().await?));
+          let pid = connection_pid(conn.lock().await.as_mut()).await?;
+          Ok((conn, pid))
+        }
+        .in_current_span(),
+      ),
+      first_query,
+      statement_type,
+    });
     Ok(())
   }
 
@@ -129,7 +135,9 @@ impl Database for PostgresDriver<'_> {
     match self.task.take() {
       Some(task) => {
         match task {
+          PostgresTask::QueryConnect { handle, .. } => handle.abort(),
           PostgresTask::Query(handle) => handle.abort(),
+          PostgresTask::TxConnect { handle, .. } => handle.abort(),
           PostgresTask::TxStart(handle) => handle.abort(),
           _ => {},
         };
@@ -169,6 +177,30 @@ impl Database for PostgresDriver<'_> {
   async fn get_query_results(&mut self) -> Result<DbTaskResult> {
     let (task_result, next_task) = match self.task.take() {
       None => (DbTaskResult::NoTask, None),
+      Some(PostgresTask::QueryConnect { handle, first_query, statement_type }) => {
+        if !handle.is_finished() {
+          (
+            DbTaskResult::Pending,
+            Some(PostgresTask::QueryConnect { handle, first_query, statement_type }),
+          )
+        } else {
+          match handle.await? {
+            Ok((conn, pid)) => {
+              log::info!("Starting query with PID {}", pid.clone());
+              self.querying_conn = Some(conn.clone());
+              self.querying_pid = Some(pid.to_string());
+              (
+                DbTaskResult::Pending,
+                Some(PostgresTask::Query(spawn_query_task(conn, first_query, statement_type))),
+              )
+            },
+            Err(e) => {
+              log::error!("Connection acquisition failed: {e:?}");
+              (DbTaskResult::Finished(QueryResultsWithMetadata::new(Err(e), statement_type)), None)
+            },
+          }
+        }
+      },
       Some(PostgresTask::Query(handle)) => {
         if !handle.is_finished() {
           (DbTaskResult::Pending, Some(PostgresTask::Query(handle)))
@@ -177,6 +209,51 @@ impl Database for PostgresDriver<'_> {
           self.querying_conn = None;
           self.querying_pid = None;
           (DbTaskResult::Finished(result), None)
+        }
+      },
+      Some(PostgresTask::TxConnect {
+        handle,
+        first_query,
+        statement_type,
+        display_statement_type,
+      }) => {
+        if !handle.is_finished() {
+          (
+            DbTaskResult::Pending,
+            Some(PostgresTask::TxConnect {
+              handle,
+              first_query,
+              statement_type,
+              display_statement_type,
+            }),
+          )
+        } else {
+          match handle.await? {
+            Ok((tx, pid)) => {
+              log::info!("Starting transaction with PID {}", pid.clone());
+              self.querying_pid = Some(pid.to_string());
+              (
+                DbTaskResult::Pending,
+                Some(PostgresTask::TxStart(spawn_tx_task(
+                  tx,
+                  first_query,
+                  statement_type,
+                  *display_statement_type,
+                ))),
+              )
+            },
+            Err(e) => {
+              log::error!("Transaction didn't start: {e:?}");
+              (
+                DbTaskResult::Finished(QueryResultsWithMetadata::with_display_statement_type(
+                  Err(e),
+                  Some(statement_type),
+                  Some(*display_statement_type),
+                )),
+                None,
+              )
+            },
+          }
         }
       },
       Some(PostgresTask::TxStart(handle)) => {
@@ -228,55 +305,20 @@ impl Database for PostgresDriver<'_> {
     let (first_query, statement_type) = super::get_first_query(query, Driver::Postgres)?;
     let display_statement_type = super::get_display_statement_for_execution_type(&statement_type);
     let statement_type = super::get_statement_for_execution_type(&statement_type);
-    let mut tx = self.pool.clone().unwrap().begin().await?;
-    let pid = sqlx::raw_sql("SELECT pg_backend_pid()").fetch_one(&mut *tx).await?.get::<i32, _>(0);
-    log::info!("Starting transaction with PID {}", pid.clone());
-    self.querying_pid = Some(pid.to_string().clone());
-    self.task = Some(PostgresTask::TxStart(tokio::spawn(
-      async move {
-        let (results, tx) = query_with_tx(tx, &first_query).await;
-        match results {
-          Ok(Either::Left(rows_affected)) => {
-            log::info!("{rows_affected:?} rows affected");
-            (
-              QueryResultsWithMetadata {
-                results: Ok(Rows {
-                  headers: vec![],
-                  rows: vec![],
-                  rows_affected: Some(rows_affected),
-                }),
-                statement_type: Some(statement_type),
-                display_statement_type: Some(display_statement_type),
-              },
-              tx,
-            )
-          },
-          Ok(Either::Right(rows)) => {
-            log::info!("{:?} rows affected", rows.rows_affected);
-            (
-              QueryResultsWithMetadata::with_display_statement_type(
-                Ok(rows),
-                Some(statement_type),
-                Some(display_statement_type),
-              ),
-              tx,
-            )
-          },
-          Err(e) => {
-            log::error!("{e:?}");
-            (
-              QueryResultsWithMetadata::with_display_statement_type(
-                Err(e),
-                Some(statement_type),
-                Some(display_statement_type),
-              ),
-              tx,
-            )
-          },
+    let pool = self.pool.clone().unwrap();
+    self.task = Some(PostgresTask::TxConnect {
+      handle: tokio::spawn(
+        async move {
+          let mut tx = pool.begin().await?;
+          let pid = connection_pid(&mut tx).await?;
+          Ok((tx, pid))
         }
-      }
-      .in_current_span(),
-    )));
+        .in_current_span(),
+      ),
+      first_query,
+      statement_type,
+      display_statement_type: Box::new(display_statement_type),
+    });
     Ok(())
   }
 
@@ -305,15 +347,36 @@ impl Database for PostgresDriver<'_> {
     Ok(())
   }
 
-  async fn load_menu(&self) -> Result<Rows> {
+  fn start_load_menu(&self) -> Result<JoinHandle<Result<Rows>>> {
     let pool = self.pool.clone().unwrap();
-    match query_with_pool(pool.clone(), MENU_QUERY.to_owned()).await {
-      Ok(rows) => Ok(rows),
-      Err(e) => {
-        log::warn!("Falling back to simple PostgreSQL menu query: {e:?}");
-        query_with_pool(pool, SIMPLE_MENU_QUERY.to_owned()).await
-      },
-    }
+    Ok(tokio::spawn(async move {
+      match query_with_pool(pool.clone(), MENU_QUERY.to_owned()).await {
+        Ok(rows) => Ok(rows),
+        Err(e) => {
+          log::warn!("Falling back to simple PostgreSQL menu query: {e:?}");
+          query_with_pool(pool, SIMPLE_MENU_QUERY.to_owned()).await
+        },
+      }
+    }))
+  }
+
+  fn start_load_columns(
+    &self,
+    tables: Vec<TableRef>,
+  ) -> Result<JoinHandle<Result<Vec<TableColumns>>>> {
+    let pool = self.pool.clone().unwrap();
+    Ok(tokio::spawn(async move {
+      let mut output = Vec::with_capacity(tables.len());
+      for table in tables {
+        let schema = table.schema.replace('\'', "''");
+        let name = table.table.replace('\'', "''");
+        let query = format!(
+          "select column_name, data_type from information_schema.columns where table_schema = '{schema}' and table_name = '{name}' order by ordinal_position"
+        );
+        output.push(table_columns_from_rows(table, query_with_pool(pool.clone(), query).await?));
+      }
+      Ok(output)
+    }))
   }
 
   fn preview_rows_query(&self, schema: &str, table: &str) -> String {
@@ -366,7 +429,7 @@ impl Database for PostgresDriver<'_> {
   }
 }
 
-impl PostgresDriver<'_> {
+impl PostgresDriver {
   pub fn new() -> Self {
     Self { pool: None, task: None, querying_conn: None, querying_pid: None }
   }
@@ -374,8 +437,9 @@ impl PostgresDriver<'_> {
   fn build_connection_opts(
     args: crate::cli::Cli,
   ) -> Result<<<sqlx::Postgres as sqlx::Database>::Connection as sqlx::Connection>::Options> {
-    match args.connection_url {
-      Some(url) => Ok(PgConnectOptions::from_str(url.trim().trim_start_matches("jdbc:"))?),
+    let ssl_required = args.ssl_required;
+    let opts = match args.connection_url {
+      Some(url) => PgConnectOptions::from_str(url.trim().trim_start_matches("jdbc:"))?,
       None => {
         let mut opts = PgConnectOptions::new();
 
@@ -443,9 +507,18 @@ impl PostgresDriver<'_> {
           }
         }
 
-        Ok(opts)
+        opts
       },
-    }
+    };
+
+    Ok(if ssl_required {
+      match opts.get_ssl_mode() {
+        PgSslMode::VerifyCa | PgSslMode::VerifyFull => opts,
+        _ => opts.ssl_mode(PgSslMode::Require),
+      }
+    } else {
+      opts
+    })
   }
 }
 
@@ -455,6 +528,71 @@ async fn query_with_pool(pool: Arc<sqlx::Pool<Postgres>>, query: String) -> Resu
 
 async fn query_with_conn(conn: &mut PgConnection, query: String) -> Result<Rows> {
   query_with_stream(conn, &query).await
+}
+
+fn spawn_query_task(
+  conn: Arc<Mutex<PoolConnection<Postgres>>>,
+  first_query: String,
+  statement_type: Option<Statement>,
+) -> QueryTask {
+  tokio::spawn(async move {
+    let results = query_with_conn(conn.lock().await.as_mut(), first_query.clone()).await;
+    match results {
+      Ok(ref rows) => {
+        log::info!("{:?} rows, {:?} affected", rows.rows.len(), rows.rows_affected);
+      },
+      Err(ref e) => {
+        log::error!("{e:?}");
+      },
+    };
+    QueryResultsWithMetadata::new(results, statement_type.clone())
+  })
+}
+
+fn spawn_tx_task(
+  tx: PostgresTransaction,
+  first_query: String,
+  statement_type: Statement,
+  display_statement_type: Statement,
+) -> TransactionTask {
+  tokio::spawn(async move {
+    let (results, tx) = query_with_tx(tx, &first_query).await;
+    match results {
+      Ok(Either::Left(rows_affected)) => {
+        log::info!("{rows_affected:?} rows affected");
+        (
+          QueryResultsWithMetadata {
+            results: Ok(Rows { headers: vec![], rows: vec![], rows_affected: Some(rows_affected) }),
+            statement_type: Some(statement_type),
+            display_statement_type: Some(display_statement_type),
+          },
+          tx,
+        )
+      },
+      Ok(Either::Right(rows)) => {
+        log::info!("{:?} rows affected", rows.rows_affected);
+        (
+          QueryResultsWithMetadata::with_display_statement_type(
+            Ok(rows),
+            Some(statement_type),
+            Some(display_statement_type),
+          ),
+          tx,
+        )
+      },
+      Err(e) => {
+        log::error!("{e:?}");
+        (
+          QueryResultsWithMetadata::with_display_statement_type(
+            Err(e),
+            Some(statement_type),
+            Some(display_statement_type),
+          ),
+          tx,
+        )
+      },
+    }
+  })
 }
 
 async fn query_with_stream<'a, E>(e: E, query: &'a str) -> Result<Rows>
@@ -484,10 +622,10 @@ where
   Ok(Rows { rows_affected: query_rows_affected, headers, rows: query_rows })
 }
 
-async fn query_with_tx<'a>(
-  mut tx: PostgresTransaction<'static>,
+async fn query_with_tx(
+  mut tx: PostgresTransaction,
   query: &str,
-) -> (Result<Either<u64, Rows>>, PostgresTransaction<'static>)
+) -> (Result<Either<u64, Rows>>, PostgresTransaction)
 where
   for<'c> <sqlx::Postgres as sqlx::Database>::Arguments<'c>:
     sqlx::IntoArguments<'c, sqlx::Postgres>,
@@ -514,6 +652,14 @@ where
     },
     Err(e) => (Err(eyre::Report::new(e)), tx),
   }
+}
+
+async fn connection_pid(conn: &mut PgConnection) -> Result<i32>
+where
+  for<'c> &'c mut <sqlx::Postgres as sqlx::Database>::Connection:
+    sqlx::Executor<'c, Database = sqlx::Postgres>,
+{
+  Ok(sqlx::query_scalar("SELECT pg_backend_pid()").fetch_one(conn).await?)
 }
 
 fn get_headers(row: &<sqlx::Postgres as sqlx::Database>::Row) -> Headers {
@@ -747,10 +893,69 @@ fn parse_value(
 
 #[cfg(test)]
 mod tests {
+  use clap::Parser;
   use sqlparser::{ast::Statement, dialect::PostgreSqlDialect, parser::ParserError};
+  use sqlx::postgres::PgSslMode;
 
   use super::*;
   use crate::database::{ExecutionType, ParseError, get_execution_type, get_first_query};
+
+  #[test]
+  fn ssl_required_overrides_url_ssl_mode() {
+    let args = crate::cli::Cli::parse_from([
+      "rainfrog",
+      "--url",
+      "postgres://localhost/postgres?sslmode=disable",
+      "--ssl-required",
+    ]);
+    let opts = PostgresDriver::build_connection_opts(args).unwrap();
+    assert!(matches!(opts.get_ssl_mode(), PgSslMode::Require));
+  }
+
+  #[test]
+  fn ssl_required_preserves_stricter_url_ssl_modes() {
+    for (mode, expected) in
+      [("verify-ca", PgSslMode::VerifyCa), ("verify-full", PgSslMode::VerifyFull)]
+    {
+      let args = crate::cli::Cli::parse_from([
+        "rainfrog",
+        "--url",
+        &format!("postgres://localhost/postgres?sslmode={mode}"),
+        "--ssl-required",
+      ]);
+      let opts = PostgresDriver::build_connection_opts(args).unwrap();
+      assert!(
+        matches!(
+          (opts.get_ssl_mode(), expected),
+          (PgSslMode::VerifyCa, PgSslMode::VerifyCa)
+            | (PgSslMode::VerifyFull, PgSslMode::VerifyFull)
+        ),
+        "mode {mode} was not preserved"
+      );
+    }
+  }
+
+  #[test]
+  fn ssl_required_applies_to_structured_options() {
+    let args = crate::cli::Cli::parse_from([
+      "rainfrog",
+      "--driver",
+      "postgres",
+      "--username",
+      "user",
+      "--password",
+      "password",
+      "--host",
+      "localhost",
+      "--port",
+      "5432",
+      "--database",
+      "postgres",
+      "--ssl-required",
+    ]);
+    let opts = PostgresDriver::build_connection_opts(args).unwrap();
+    assert!(matches!(opts.get_ssl_mode(), PgSslMode::Require));
+  }
 
   #[test]
   fn test_get_first_query() {
